@@ -171,14 +171,14 @@ func (p *proxy) handle(ctx context.Context, client net.Conn) {
 	})
 	defer stopKiller()
 
-	// io.Copy returning nil means src sent FIN: that peer is done writing.
+	// A copy ending without error means src sent FIN: that peer is done writing.
 	// Forward it with CloseWrite rather than Close, so dst learns the input is
 	// over while the reply path stays open -- servers that read until EOF
 	// before answering deadlock otherwise. The connection is only closed once
 	// both directions are finished, by the defers above. A real error instead
 	// takes the whole connection down; there is no reply left to wait for.
 	pipe := func(dst, src net.Conn) (int64, error) {
-		n, err := io.Copy(dst, src)
+		n, err := copyStream(dst, src, p.cfg.idleTimeout)
 		if err != nil {
 			client.Close()
 			remote.Close()
@@ -206,12 +206,71 @@ func (p *proxy) handle(ctx context.Context, client net.Conn) {
 		"duration", time.Since(started).Round(time.Millisecond).String())
 }
 
+// bufPool hands out the 32 KiB scratch buffers the idle-timeout copy path
+// needs, so a burst of short connections does not churn the garbage collector.
+//
+// It stores *[]byte, not []byte. An interface value carries a single
+// pointer-sized word of data, while a slice is three words (array, len, cap),
+// so handing Put a bare slice makes Go heap-allocate a 24 byte box just to
+// hold that header -- one allocation on every Put, in the very path the pool
+// exists to keep allocation-free. A pointer needs no box. The 32 KiB array
+// itself is reused either way; only the header costs.
+var bufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 32*1024)
+		return &b
+	},
+}
+
+// copyStream copies src into dst and reports a clean EOF as a nil error.
+//
+// Without an idle timeout this is a plain io.Copy, which on Linux lets the
+// kernel move the bytes between the two sockets with splice(2); they never
+// reach user space. An idle timeout needs a deadline refreshed around every
+// read and write, which rules that out, so there we borrow a buffer and copy
+// through it instead.
+func copyStream(dst, src net.Conn, idle time.Duration) (int64, error) {
+	if idle <= 0 {
+		return io.Copy(dst, src)
+	}
+	bufp := bufPool.Get().(*[]byte)
+	defer bufPool.Put(bufp)
+	return io.CopyBuffer(&idleConn{Conn: dst, idle: idle}, &idleConn{Conn: src, idle: idle}, *bufp)
+}
+
+// idleConn pushes the deadline back before every read and write, so a transfer
+// that keeps making progress is never cut off while a silent one is. Embedding
+// net.Conn carries over every other method; only Read and Write are replaced.
+//
+// It hides the ReaderFrom and WriterTo of the underlying socket on purpose:
+// io.CopyBuffer skips both the deadlines and the supplied buffer whenever it
+// can hand the whole transfer to one of those instead.
+type idleConn struct {
+	net.Conn
+	idle time.Duration
+}
+
+func (c *idleConn) Read(b []byte) (int, error) {
+	if err := c.Conn.SetReadDeadline(time.Now().Add(c.idle)); err != nil {
+		return 0, err
+	}
+	return c.Conn.Read(b)
+}
+
+func (c *idleConn) Write(b []byte) (int, error) {
+	if err := c.Conn.SetWriteDeadline(time.Now().Add(c.idle)); err != nil {
+		return 0, err
+	}
+	return c.Conn.Write(b)
+}
+
 func logCopyErr(log *slog.Logger, direction string, err error) {
 	if err == nil {
 		return
 	}
+	var ne net.Error
 	if errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe) ||
-		errors.Is(err, context.Canceled) {
+		errors.Is(err, context.Canceled) || (errors.As(err, &ne) && ne.Timeout()) {
 		log.Debug("copy stopped", "direction", direction, "err", err)
 		return
 	}

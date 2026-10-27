@@ -286,6 +286,44 @@ func TestProxyShutdownClosesOpenConnections(t *testing.T) {
 	}
 }
 
+func TestProxyIdleTimeout(t *testing.T) {
+	front, _ := startProxy(t, echoServer(t), func(c *config) { c.idleTimeout = 150 * time.Millisecond })
+
+	c, err := net.Dial("tcp", front.String())
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := c.Read(make([]byte, 1)); err == nil {
+		t.Fatal("idle connection was not dropped")
+	}
+}
+
+// TestProxyIdleTimeoutRefreshes checks that the deadline tracks progress: a
+// connection busy for longer than the timeout, with every gap shorter than it,
+// must survive.
+func TestProxyIdleTimeoutRefreshes(t *testing.T) {
+	const idle = 300 * time.Millisecond
+	front, _ := startProxy(t, echoServer(t), func(c *config) { c.idleTimeout = idle })
+
+	c, err := net.Dial("tcp", front.String())
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(10 * time.Second))
+
+	started := time.Now()
+	for i := range 5 {
+		time.Sleep(idle / 2)
+		roundTrip(t, c, fmt.Sprintf("tick-%d", i))
+	}
+	if elapsed := time.Since(started); elapsed < idle {
+		t.Fatalf("test ran for %v, less than the %v idle timeout it means to outlast", elapsed, idle)
+	}
+}
+
 func TestRunArgumentErrors(t *testing.T) {
 	cases := [][]string{
 		{},

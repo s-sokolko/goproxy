@@ -34,13 +34,14 @@ const usageFooter = `
 Examples:
   goproxy 8080 10.0.0.5:80                     expose an internal web server
   goproxy -v 127.0.0.1:5432 db.internal:5432   forward a database port, logging each connection
-  goproxy -max-conns 100 :2222 ssh.internal:22
+  goproxy -max-conns 100 -idle-timeout 5m :2222 ssh.internal:22
 `
 
 type config struct {
 	listen         Addr
 	remote         Addr
 	connectTimeout time.Duration
+	idleTimeout    time.Duration
 	drainTimeout   time.Duration
 	maxConns       int
 	verbose        bool
@@ -66,6 +67,7 @@ func run(args []string) error {
 	fs.StringVar(&remoteArg, "r", "", "address to forward connections to")
 	fs.StringVar(&remoteArg, "remote", "", "address to forward connections to")
 	fs.DurationVar(&cfg.connectTimeout, "connect-timeout", 10*time.Second, "give up dialling the remote after this long")
+	fs.DurationVar(&cfg.idleTimeout, "idle-timeout", 0, "drop a connection after this long without traffic (0 disables it)")
 	fs.DurationVar(&cfg.drainTimeout, "drain-timeout", 10*time.Second, "on shutdown, wait this long for open connections before closing them")
 	fs.IntVar(&cfg.maxConns, "max-conns", 0, "maximum number of concurrent connections (0 is unlimited)")
 	fs.BoolVar(&cfg.verbose, "v", false, "log every connection and copy error")
